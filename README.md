@@ -75,6 +75,14 @@ docker compose logs -f bot
 
 The SQLite database (including WAL files) persists in `./data:/app/data`. The container is limited to 512 MiB.
 
+**Linux hosts (VPS):** the container runs as non-root user `app` (uid 1000). The bind-mounted `./data` directory must be writable by that uid, otherwise the bot crash-loops with `sqlite3.OperationalError: unable to open database file`:
+
+```bash
+mkdir -p data && chown -R 1000:1000 data   # run before first `docker compose up`
+```
+
+Re-run `chown -R 1000:1000 data` whenever root-owned files land in `data/` (e.g. after scp'ing a database as root).
+
 ## Commands
 
 | Trigger | Args | Behavior |

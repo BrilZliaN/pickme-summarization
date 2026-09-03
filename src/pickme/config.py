@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     router_fastpath: bool = True
     rate_limit_per_60s: int = 8
     llm_concurrency: int = 2
+    llm_timeout_seconds: int = 90
     log_level: str = "INFO"
     data_dir: str = "data"
 

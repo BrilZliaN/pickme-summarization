@@ -139,8 +139,18 @@ class ProviderRegistry:
         hetzner_primary: str = str(getattr(s, "llm_primary_model", "Qwen/Qwen3.6-35B-A3B-FP8"))
         hetzner_fallback: str = str(getattr(s, "llm_fallback_model", "Qwen3.8-27B"))
 
+        # Hard per-request timeout + SDK retries OFF: our tier loop owns
+        # retry/failover (plan §5). Prevents a hung gateway (504-after-300s)
+        # from blocking the worker for the SDK's 600s default.
+        llm_timeout = float(getattr(s, "llm_timeout_seconds", 90))
+
         if hetzner_key:
-            client = AsyncOpenAI(base_url=hetzner_base, api_key=hetzner_key)
+            client = AsyncOpenAI(
+                base_url=hetzner_base,
+                api_key=hetzner_key,
+                timeout=llm_timeout,
+                max_retries=0,
+            )
             tier = Tier(
                 name="hetzner",
                 base_url=hetzner_base,
@@ -161,6 +171,8 @@ class ProviderRegistry:
             client = AsyncOpenAI(
                 base_url=zen_base,
                 api_key=opencode_key,
+                timeout=llm_timeout,
+                max_retries=0,
                 default_headers={
                     "User-Agent": "pickme-bot/1.0",
                     "x-opencode-session": _SESSION_ID,
@@ -185,6 +197,8 @@ class ProviderRegistry:
             client = AsyncOpenAI(
                 base_url=go_base,
                 api_key=opencode_key,
+                timeout=llm_timeout,
+                max_retries=0,
                 default_headers={
                     "User-Agent": "pickme-bot/1.0",
                     "x-opencode-session": _SESSION_ID,
