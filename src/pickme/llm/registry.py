@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -49,6 +50,7 @@ class Tier:
     model: str
     client: object  # openai.AsyncOpenAI
     fallback_model: str | None = None  # only hetzner carries a fallback
+    free_preferences: list[str] | None = None  # zen: ordered free-model preferences
 
 
 @dataclass
@@ -96,6 +98,7 @@ class ProviderRegistry:
         self._bucket: TokenBucket = bucket  # type: ignore[assignment]
         self._tiers: list[Tier] = []
         self._breakers: dict[str, _BreakerState] = {}
+        self._zen_candidates: list[str] = []  # last-known selectable free pool (pref order)
         self._health_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()  # guards tier list / breaker updates
@@ -133,16 +136,53 @@ class ProviderRegistry:
 
             AsyncOpenAI = _DummyAsyncOpenAI  # type: ignore
 
-        # Hetzner tier (T1)
-        hetzner_key: str = str(getattr(s, "hetzner_api_key", "") or "")
-        hetzner_base: str = str(getattr(s, "hetzner_base_url", "https://inference.hetzner.com/api/v1"))
-        hetzner_primary: str = str(getattr(s, "llm_primary_model", "Qwen/Qwen3.6-35B-A3B-FP8"))
-        hetzner_fallback: str = str(getattr(s, "llm_fallback_model", "Qwen3.8-27B"))
-
         # Hard per-request timeout + SDK retries OFF: our tier loop owns
         # retry/failover (plan §5). Prevents a hung gateway (504-after-300s)
         # from blocking the worker for the SDK's 600s default.
         llm_timeout = float(getattr(s, "llm_timeout_seconds", 90))
+
+        # Zen tier (T1, primary) — free models with multi-model selection
+        opencode_key: str = str(getattr(s, "opencode_api_key", "") or "")
+        zen_base: str = str(getattr(s, "zen_base_url", "https://opencode.ai/zen/v1"))
+        zen_preferences: list[str] = [
+            m.strip()
+            for m in str(getattr(s, "zen_free_models", "") or "").split(",")
+            if m.strip()
+        ]
+        if not zen_preferences:
+            single = str(getattr(s, "zen_free_model", "space-bunny-free"))
+            if single:
+                zen_preferences = [single]
+        zen_initial: str = zen_preferences[0] if zen_preferences else "space-bunny-free"
+
+        if opencode_key:
+            client = AsyncOpenAI(
+                base_url=zen_base,
+                api_key=opencode_key,
+                timeout=llm_timeout,
+                max_retries=0,
+                default_headers={
+                    "User-Agent": "pickme-bot/1.0",
+                    "x-opencode-session": _SESSION_ID,
+                },
+            )
+            tier = Tier(
+                name="zen",
+                base_url=zen_base,
+                api_key=opencode_key,
+                model=zen_initial,
+                client=client,
+                free_preferences=zen_preferences,
+            )
+            self._tiers.append(tier)
+            self._breakers[tier.name] = _BreakerState()
+
+        # Hetzner tier (T2, capacity fallback) — free; output quality observed
+        # inferior, so it only serves when Zen is breaker-open.
+        hetzner_key: str = str(getattr(s, "hetzner_api_key", "") or "")
+        hetzner_base: str = str(getattr(s, "hetzner_base_url", "https://inference.hetzner.com/api/v1"))
+        hetzner_primary: str = str(getattr(s, "llm_primary_model", "Qwen/Qwen3.6-35B-A3B-FP8"))
+        hetzner_fallback: str = str(getattr(s, "llm_fallback_model", "Qwen3.8-27B"))
 
         if hetzner_key:
             client = AsyncOpenAI(
@@ -162,33 +202,7 @@ class ProviderRegistry:
             self._tiers.append(tier)
             self._breakers[tier.name] = _BreakerState()
 
-        # Zen tier (T2)
-        opencode_key: str = str(getattr(s, "opencode_api_key", "") or "")
-        zen_base: str = str(getattr(s, "zen_base_url", "https://opencode.ai/zen/v1"))
-        zen_model: str = str(getattr(s, "zen_free_model", "mimo-v2.5-free"))
-
-        if opencode_key:
-            client = AsyncOpenAI(
-                base_url=zen_base,
-                api_key=opencode_key,
-                timeout=llm_timeout,
-                max_retries=0,
-                default_headers={
-                    "User-Agent": "pickme-bot/1.0",
-                    "x-opencode-session": _SESSION_ID,
-                },
-            )
-            tier = Tier(
-                name="zen",
-                base_url=zen_base,
-                api_key=opencode_key,
-                model=zen_model,
-                client=client,
-            )
-            self._tiers.append(tier)
-            self._breakers[tier.name] = _BreakerState()
-
-        # Go tier (T3)
+        # Go tier (T3, paid last resort)
         go_enabled: bool = bool(getattr(s, "go_enabled", True))
         go_base: str = str(getattr(s, "go_base_url", "https://opencode.ai/zen/go/v1"))
         go_model: str = str(getattr(s, "go_model", "mimo-v2.5"))
@@ -214,7 +228,7 @@ class ProviderRegistry:
             self._tiers.append(tier)
             self._breakers[tier.name] = _BreakerState()
 
-        # Cost order is already hetzner, zen, go as appended.
+        # Chain order (quality-first, free-before-paid): zen -> hetzner -> go.
         logger.info("provider tiers: %s", [f"{t.name}:{t.model}" for t in self._tiers])
 
     # -- lifecycle ---------------------------------------------------------
@@ -411,6 +425,13 @@ class ProviderRegistry:
                 self.mark_failure(tier.name, "model_missing")
             return
 
+        # Zen: multi-model free selection. Handled exclusively here — zen must
+        # never fall through to the generic first-listed-model switch below,
+        # which could silently select a PAID model.
+        if tier.name == "zen" and tier.free_preferences is not None:
+            self._zen_select_model(tier, model_ids)
+            return
+
         # Check if configured model is listed.
         if tier.model in model_ids:
             # Healthy; if was model_missing, clear it.
@@ -439,6 +460,63 @@ class ProviderRegistry:
         st = self._breakers.get(tier.name)
         if st and st.open_model_missing:
             self.mark_success(tier.name)
+
+    def _zen_select_model(self, tier: Tier, model_ids: list[str]) -> None:
+        """Select the Zen free model from a live models listing.
+
+        Filter the listing by ``-free`` suffix; prefer the configured
+        preference order (honored when present in the listing even without the
+        suffix, e.g. big-pickle); else pick randomly from the free pool.
+        Selection only changes when the current model is no longer selectable.
+        Never selects a paid model automatically.
+        """
+        free_pool = sorted({m for m in model_ids if m.endswith("-free")})
+        selectable = set(free_pool)
+        for pref in tier.free_preferences or []:
+            if pref in model_ids:
+                selectable.add(pref)
+        selectable_sorted = sorted(selectable)
+        if not selectable_sorted:
+            logger.warning("zen: no free models in listing -> model_missing")
+            self.mark_failure("zen", "model_missing")
+            return
+        # Cache the rotation order for tier_model_candidates(): preferences
+        # first (in configured order), then the remaining free pool sorted.
+        ordered = [p for p in (tier.free_preferences or []) if p in selectable]
+        ordered += sorted(set(selectable_sorted) - set(ordered))
+        self._zen_candidates = ordered
+        st = self._breakers.get("zen")
+        if tier.model in selectable_sorted:
+            if st and st.open_model_missing:
+                self.mark_success("zen")
+                logger.info("zen model %s still selectable -> breaker closed", tier.model)
+            return
+        for pref in tier.free_preferences or []:
+            if pref in selectable_sorted:
+                tier.model = pref
+                logger.info("zen model selected from preferences: %s", pref)
+                break
+        else:
+            tier.model = random.choice(selectable_sorted)
+            logger.info(
+                "zen model picked randomly from %d free models: %s",
+                len(selectable_sorted),
+                tier.model,
+            )
+        if st and st.open_model_missing:
+            self.mark_success("zen")
+
+    def tier_model_candidates(self, tier: Tier) -> list[str]:
+        """Ordered models to try within one tier for a single request (429 rotation).
+
+        Zen: current selection first, then the rest of the last-known selectable
+        free pool (preference order first). Other tiers: their single model.
+        Used by LLMClient.chat() to rotate models on 429 before failing over
+        to the next provider.
+        """
+        if tier.name == "zen" and tier.free_preferences is not None and self._zen_candidates:
+            return [tier.model] + [m for m in self._zen_candidates if m != tier.model]
+        return [tier.model]
 
     async def _health_poll_loop(self) -> None:
         """Periodic health poll every 150s (infrequent; drives failover/fail-back)."""

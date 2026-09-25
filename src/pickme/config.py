@@ -18,7 +18,8 @@ class Settings(BaseSettings):
     llm_fallback_model: str = "Qwen3.8-27B"
     opencode_api_key: str = ""
     zen_base_url: str = "https://opencode.ai/zen/v1"
-    zen_free_model: str = "mimo-v2.5-free"
+    zen_free_model: str = "space-bunny-free"  # legacy singular (used when ZEN_FREE_MODELS is empty)
+    zen_free_models: str = "space-bunny-free,big-pickle,mimo-v2.6-flash-free"  # csv preference list
     go_base_url: str = "https://opencode.ai/zen/go/v1"
     go_model: str = "mimo-v2.5"
     go_enabled: bool = True

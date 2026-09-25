@@ -10,7 +10,7 @@ Telegram bot that tracks group-chat messages and provides LLM-powered summarizat
 - **Evaluation** — `/evaluate [@user | me | everyone]` renders rubric-based Markdown cards.
 - **Grounded Q&A** — `/ask` / mention / reply-to-bot with rolling summary + profile + recent-window context.
 - **Natural-language intent routing** — keyword fast-path + LLM JSON intent classifier (defaults to Q&A).
-- **Three-tier LLM failover** — Hetzner (free) → OpenCode Zen free → OpenCode Go, with token-bucket rate limiting and circuit breakers.
+- **Three-tier LLM failover** — OpenCode Zen free (primary, multi-model selection) → Hetzner (free) → OpenCode Go (paid), with token-bucket rate limiting, immediate 429 model/provider failover, and circuit breakers.
 
 ## ⚠️ CRITICAL: Privacy Mode
 
@@ -37,7 +37,8 @@ If privacy mode stays **Enabled** and the bot is not an admin, it will only see 
 | `LLM_FALLBACK_MODEL` | `Qwen3.8-27B` | In-tier fallback model |
 | `OPENCODE_API_KEY` | `""` | Single key for Zen + Go — via https://opencode.ai/auth |
 | `ZEN_BASE_URL` | `https://opencode.ai/zen/v1` | OpenCode Zen base URL |
-| `ZEN_FREE_MODEL` | `mimo-v2.5-free` | Zen free model |
+| `ZEN_FREE_MODEL` | `space-bunny-free` | Zen free model (used when `ZEN_FREE_MODELS` is empty) |
+| `ZEN_FREE_MODELS` | `space-bunny-free,big-pickle,mimo-v2.6-flash-free` | CSV preference list of Zen free models; first match in the live `/models` listing wins, else a random `-free` model. Explicit entries may include unsuffixed free models (e.g. `big-pickle`) |
 | `GO_BASE_URL` | `https://opencode.ai/zen/go/v1` | OpenCode Go base URL |
 | `GO_MODEL` | `mimo-v2.5` | Go model |
 | `GO_ENABLED` | `1` | Enable Go tier (`0` to disable) |

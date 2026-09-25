@@ -2,12 +2,13 @@
 
 Telegram bot that tracks group-chat messages and provides LLM-powered summarization,
 per-user memory, user evaluation, and grounded Q&A — including **natural-language
-commands** ("hey bot, summarize last messages for me") — via the free Hetzner
-Experiments Inference API.
+commands** ("hey bot, summarize last messages for me") — via free LLM inference
+with tiered failover (OpenCode Zen free → Hetzner → OpenCode Go).
 
 **Stack (locked):** Python 3.12+ · aiogram 3.x (async) · SQLite (WAL) ·
 Docker Compose on a Hetzner VPS · OpenAI-compatible LLM clients with 3-tier
-provider failover: Hetzner (free) → OpenCode Zen free models → OpenCode Go.
+provider failover: OpenCode Zen free (primary, multi-model) → Hetzner (free) →
+OpenCode Go (paid).
 
 **Key external constraint:** Hetzner's free tier enforces a request-level limit of
 ~10 requests / 60s per key (in addition to token caps). The binding constraint is
@@ -47,14 +48,14 @@ at this scale.
         │                │                               │
         │                ▼                               │
         │   LLMClient (OpenAI-compatible, 3 tiers)      │
-        │     ├─ T1 Hetzner (free, primary)             │
-        │     ├─ T2 OpenCode Zen free (mimo-v2.5-free)  │
+        │     ├─ T1 Zen free (multi-model, primary)     │
+        │     ├─ T2 Hetzner (free, capacity fallback)   │
         │     ├─ T3 OpenCode Go sub (mimo-v2.5, paid)   │
         │     └─ per-tier health poll + breaker         │
         └──────────────────────────────────────────────┘
                                 │  HTTPS
                                 ▼
-          Hetzner → OpenCode Zen (free) → OpenCode Go
+          Zen free → Hetzner → OpenCode Go
               (failover chain; see §5 for URLs/models)
 ```
 
@@ -356,12 +357,13 @@ class LLMClient(Protocol):
   opencode tiers is unconfirmed → always keep a robust JSON-from-text parse
   fallback), and `extra_body={"chat_template_kwargs":{"enable_thinking": False}}`
   on the Hetzner tier only (undocumented — try/except, non-fatal if ignored).
-- **Provider chain (`registry.py`) — cost-ordered, failover down, recover up:**
+- **Provider chain (`registry.py`) — quality-first, free-before-paid; failover
+  down, recover up:**
 
   | Tier | Provider | Base URL | Model (config) | Cost |
   |---|---|---|---|---|
-  | 1 | Hetzner Inference | `https://inference.hetzner.com/api/v1` | `LLM_PRIMARY_MODEL` (in-tier fallback: `LLM_FALLBACK_MODEL`) | free |
-  | 2 | OpenCode Zen | `https://opencode.ai/zen/v1` | `ZEN_FREE_MODEL` (def `mimo-v2.5-free`) | free (limited-time) |
+  | 1 | OpenCode Zen | `https://opencode.ai/zen/v1` | `ZEN_FREE_MODELS` preference list, else random `-free` model (def `space-bunny-free,big-pickle,mimo-v2.6-flash-free`) | free (limited-time) |
+  | 2 | Hetzner Inference | `https://inference.hetzner.com/api/v1` | `LLM_PRIMARY_MODEL` (in-tier fallback: `LLM_FALLBACK_MODEL`) — quality-inferior capacity fallback | free |
   | 3 | OpenCode Go | `https://opencode.ai/zen/go/v1` | `GO_MODEL` (def `mimo-v2.5`) | $10/mo sub quotas |
 
   - **Auth:** `HETZNER_API_KEY` + one long-lived `OPENCODE_API_KEY` (the same key
@@ -375,7 +377,11 @@ class LLMClient(Protocol):
     tiers are down.
   - **Discovery per tier:** startup + periodic `GET {base_url}/models`; use the
     configured model if listed, else the first known-compatible one. Hot-swap
-    via env / `set_primary()` without restart.
+    via env / `set_primary()` without restart. **Zen multi-model:** the listing
+    is filtered by `-free` suffix; the first available entry of the
+    `ZEN_FREE_MODELS` preference list wins, else a random free model is picked.
+    Re-selection happens only when the current model leaves the selectable set;
+    Zen never auto-switches to a paid model.
   - **Endpoint-style caveat:** the chain is restricted to `/chat/completions`
     models (the MiMo family qualifies on both Zen-free and Go). Qwen models on
     Go use the Anthropic-style `/messages` path and are excluded unless a second
@@ -386,13 +392,15 @@ class LLMClient(Protocol):
     *rate*. Every LLM request buys a token: worker jobs, inline router calls
     (§4.6), and per-tier health polls all share this one budget.
   - Global `asyncio.Semaphore(2)` behind the bucket bounds concurrent requests.
-  - **429 → backoff only, never failover.** A 429 is the *expected* state of a
-    free tier at its limit: exponential backoff + jitter, honor `Retry-After`.
-    The **circuit breaker opens only on 5xx storms, auth errors, or a model
-    missing from its `/models` listing** — never on plain 429s — so a burst at
-    the rate limit cannot spill traffic onto paid tiers. Breaker open: that
-    tier pauses, traffic fails over (chain above); auto-recovers when the
-    tier's health poll succeeds.
+  - **429 → immediate failover.** On 429 the request moves at once to the next
+    **model** (Zen free-pool rotation, preference order first) and then the
+    next **provider** — no same-tier backoff. Only when the **whole chain** is
+    rate-limited does it wait (Retry-After-aware exponential backoff, ±jitter)
+    and retry the chain, up to 3 rounds. 429 still **never opens a circuit
+    breaker** — that stays reserved for 5xx storms, auth errors, or a model
+    missing from its `/models` listing. Accepted trade-off: sustained
+    free-tier limiting spills to paid Go; `GO_ENABLED=0` is the hard cost
+    brake.
   - **Per-chat `asyncio.Lock`** keyed by `chat_id` so two jobs for the same chat
     never race (e.g., memory merge + summarize).
   - **Request coalescing:** if a `/summarize` for a chat is already queued/running,
@@ -460,7 +468,8 @@ LLM_PRIMARY_MODEL=Qwen/Qwen3.6-35B-A3B-FP8
 LLM_FALLBACK_MODEL=Qwen3.8-27B
 OPENCODE_API_KEY=
 ZEN_BASE_URL=https://opencode.ai/zen/v1
-ZEN_FREE_MODEL=mimo-v2.5-free
+ZEN_FREE_MODEL=space-bunny-free
+ZEN_FREE_MODELS=space-bunny-free,big-pickle,mimo-v2.6-flash-free
 GO_BASE_URL=https://opencode.ai/zen/go/v1
 GO_MODEL=mimo-v2.5
 GO_ENABLED=1
@@ -493,9 +502,9 @@ SQLite path: `${DATA_DIR}/pickme.db` with WAL files on the same volume.
 **M1 — MVP (tracking + /summarize)**
 - Bot ingests all group messages to SQLite (WAL).
 - `/summarize [X]` works for default and custom X; map-reduce for large inputs.
-- LLM client with token-bucket rate limiter, semaphore, 429 backoff (never
-  breaker-opening), and circuit breaker on 5xx/auth; graceful "degraded"
-  reply.
+- LLM client with token-bucket rate limiter, semaphore, 429 immediate
+  failover (never breaker-opening), and circuit breaker on 5xx/auth; graceful
+  "degraded" reply.
 - Privacy-mode note in README/`/start`.
 - *Acceptance:* in a test group, send 200 messages, `/summarize` returns coherent
   Markdown; kill network → bot retries then reports degraded, recovers on restore.
@@ -517,7 +526,7 @@ SQLite path: `${DATA_DIR}/pickme.db` with WAL files on the same volume.
   disable when all tiers are down, and observability.
 - *Acceptance:* ask "what did we decide about X?" → answer cites chat context;
   say "summarize the last 50 for me" via mention → routed summary with correct X;
-  break Hetzner (invalid key) → bot serves via Zen free, then Go; all tiers down →
+  break Zen (invalid key) → bot serves via Hetzner, then Go; all tiers down →
   clean degraded reply; a recovered cheaper tier regains traffic; model/tier swap
   via env takes effect without code change; `/status` shows tier + health.
 
@@ -531,7 +540,7 @@ Each milestone is independently demoable and shippable.
 |---|---|---|
 | **Experimental API, model deprecation** | Features break overnight | `/v1/models` discovery + primary/fallback + hot-swap + health loop; degrade gracefully |
 | **Request-level limit ≈10/60s (binding)** | Throughput ceiling, 429 storms | Token bucket ~8 req/60s in `LLMClient` covering ALL traffic (worker, router, health polls); batching; coalescing |
-| **429 / 5xx storms** | Latency, failures | 429 → backoff only, never fails over to paid tiers; breaker opens on 5xx/auth/model-missing only |
+| **429 / 5xx storms** | Latency, failures | 429 → immediate model-then-provider failover; global backoff only when the whole chain is limited; breaker opens on 5xx/auth/model-missing only |
 | **Zen/Go rate limits unpublished (429s reported)** | Fallback tiers unstable | Per-tier breakers + failover; Zen free treated as best-effort; shared backoff |
 | **Zen free models may train on data** | Privacy gap widens | Keep author aliasing everywhere; `/status` shows active tier; tier 2 disableable via env |
 | **Go $-quota windows can exhaust** | Tier 3 dark mid-window | Quota/429 errors treated as tier-down; window roll restores it |

@@ -54,6 +54,17 @@ class LLMError(Exception):
     """Raised when all LLM tiers are exhausted or unavailable."""
 
 
+class RateLimitedError(Exception):
+    """Internal: a tier returned 429. Caller rotates model / fails over immediately."""
+
+    def __init__(self, tier: str, model: str, retry_after: float | None, exc: BaseException) -> None:
+        super().__init__(f"429 on {tier}/{model}")
+        self.tier = tier
+        self.model = model
+        self.retry_after = retry_after
+        self.exc = exc
+
+
 # ---------------------------------------------------------------------------
 # Token bucket — continuous refill
 # ---------------------------------------------------------------------------
@@ -359,28 +370,27 @@ class LLMClient:
         temperature: float | None,
         max_tokens: int | None,
         feature: str,
+        model_override: str | None = None,
     ) -> ChatResult:
-        """Execute chat on a single tier with 429 backoff and hetzner extra_body handling.
+        """Execute ONE chat attempt on a single tier+model.
 
-        Raises the last exception if all backoff attempts exhausted.
+        Policy: 429 -> raise RateLimitedError immediately (no same-tier backoff;
+        the caller rotates to the next model, then the next provider). Non-429
+        -> mark_failure (breaker) and re-raise. Hetzner extra_body 400 retries
+        once without extra_body. Global backoff lives in chat(), not here.
         """
-        # Build base kwargs.
         is_hetzner = getattr(tier, "name", "") == "hetzner"
-        attempts_429 = 0
-        max_429_attempts = 3  # up to 3 attempts on same tier
-        tried_extra_body = False
         use_extra_body = is_hetzner
+        model = model_override or tier.model
 
-        last_exc: BaseException | None = None
-
-        while attempts_429 < max_429_attempts:
+        while True:
             # One token per HTTP attempt.
             await self._bucket.acquire()
             async with self._semaphore:
                 start_ts = time.monotonic()
                 try:
                     kwargs: dict = {
-                        "model": tier.model,
+                        "model": model,
                         "messages": messages,  # type: ignore[arg-type]
                     }
                     if temperature is not None:
@@ -391,7 +401,6 @@ class LLMClient:
                         kwargs["response_format"] = {"type": "json_object"}
                     if use_extra_body:
                         kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
-                        tried_extra_body = True
 
                     # Fire the request.
                     resp = await tier.client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
@@ -433,18 +442,17 @@ class LLMClient:
                         logger.debug("mark_success failed", exc_info=True)
                     # Fire-and-forget log sink.
                     asyncio.create_task(
-                        self._log(feature, tier.name, tier.model, prompt_tokens, completion_tokens, True, None)
+                        self._log(feature, tier.name, model, prompt_tokens, completion_tokens, True, None)
                     )
                     return ChatResult(
                         text=text or "",
                         provider=tier.name,
-                        model=tier.model,
+                        model=model,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                     )
 
                 except Exception as exc:  # noqa: BLE001
-                    last_exc = exc
                     latency_ms = int((time.monotonic() - start_ts) * 1000)
                     async with self._metrics_lock:
                         self._metrics["latency_ms_last"] = latency_ms
@@ -455,59 +463,29 @@ class LLMClient:
                     if use_extra_body and sc == 400:
                         logger.info("hetzner extra_body 400, retrying without extra_body (tier=%s)", tier.name)
                         use_extra_body = False
-                        # This retry still counts as needing a new token acquisition on next loop.
-                        # Do not count as 429 attempt. Re-loop immediately for the retry.
-                        # We consumed one token already for this attempt; just loop with new token.
-                        # Avoid infinite loop: only one such retry.
                         continue
 
-                    # 429 -> backoff with jitter, up to 3 attempts, honor Retry-After.
+                    # 429 -> immediate failover: no same-tier backoff, no breaker.
                     if _is_rate_limit(exc):
                         async with self._metrics_lock:
                             self._metrics["rate_limited_429"] = int(self._metrics["rate_limited_429"]) + 1  # type: ignore[arg-type]
-                        attempts_429 += 1
-                        if attempts_429 >= max_429_attempts:
-                            # Exhausted backoff for this tier; log failure and bubble up to failover.
-                            asyncio.create_task(
-                                self._log(feature, tier.name, tier.model, 0, 0, False, f"429 exhausted: {exc}")
-                            )
-                            break
-                        # Compute backoff: 1s, 2s, 4s with ±30% jitter.
-                        base = (2 ** (attempts_429 - 1)) * 1.0
-                        jitter_factor = random.uniform(0.7, 1.3)
-                        wait = base * jitter_factor
-                        # Honor Retry-After if larger.
-                        retry_after = _retry_after_seconds(exc)
-                        if retry_after is not None and retry_after > wait:
-                            wait = retry_after
-                        logger.warning(
-                            "429 on tier %s attempt %d/%d, backing off %.2fs",
-                            tier.name,
-                            attempts_429,
-                            max_429_attempts,
-                            wait,
+                        asyncio.create_task(
+                            self._log(feature, tier.name, model, 0, 0, False, f"429: {exc}")
                         )
-                        await asyncio.sleep(wait)
-                        continue
+                        raise RateLimitedError(tier.name, model, _retry_after_seconds(exc), exc) from exc
 
-                    # Non-429 terminal failure for this tier -> log and exit tier loop, let caller failover.
+                    # Non-429 terminal failure for this tier -> breaker + failover.
                     kind = _classify_error(exc)
                     try:
                         self._registry.mark_failure(tier.name, kind)  # type: ignore[attr-defined]
                     except Exception:
                         logger.debug("mark_failure failed", exc_info=True)
                     asyncio.create_task(
-                        self._log(feature, tier.name, tier.model, 0, 0, False, f"{kind}: {exc}")
+                        self._log(feature, tier.name, model, 0, 0, False, f"{kind}: {exc}")
                     )
                     async with self._metrics_lock:
                         self._metrics["failures"] = int(self._metrics["failures"]) + 1  # type: ignore[arg-type]
-                    # Wrap to propagate classified error to outer failover loop.
-                    raise exc
-
-        # If we exited due to exhausted 429 retries, propagate last_exc.
-        if last_exc is not None:
-            raise last_exc
-        raise LLMError(f"tier {getattr(tier, 'name', '?')} failed with unknown error")
+                    raise
 
     async def chat(
         self,
@@ -520,54 +498,76 @@ class LLMClient:
     ) -> ChatResult:
         """Execute a chat completion across tiered providers.
 
-        Implements binding plan §5 semantics for rate limiting, retries and failover.
+        429 policy: fail over IMMEDIATELY — next model within the tier (Zen
+        free-pool rotation, preference order first), then the next provider.
+        Only when the whole chain is rate-limited does it wait (Retry-After-
+        aware exponential backoff with jitter) and retry the chain, up to 3
+        rounds. 429 never opens a circuit breaker; non-429 tier failures do.
         """
-        # Note: bucket acquire is done per HTTP attempt inside _call_tier.
-        # We still need to ensure overall flow acquires at least before checking tiers
-        # is handled inside _call_tier. No extra acquire here.
-
-        tiers: list[Tier] = self._registry.active_tiers()  # type: ignore[assignment]
-        if not tiers:
-            await self._log(feature, "none", "none", 0, 0, False, "all LLM tiers unavailable")
-            raise LLMError("all LLM tiers unavailable")
-
+        max_rounds = 3
         errors: list[str] = []
-        first_success: ChatResult | None = None
 
-        for idx, tier in enumerate(tiers):
-            try:
-                result = await self._call_tier(
-                    tier,
-                    messages,
-                    json_mode=json_mode,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    feature=feature,
-                )
-                if idx > 0:
-                    async with self._metrics_lock:
-                        self._metrics["tier_failovers"] = int(self._metrics["tier_failovers"]) + idx  # type: ignore[arg-type]
-                return result
-            except Exception as exc:  # noqa: BLE001
-                # _call_tier already did mark_failure for non-429 and logged.
-                # For 429-exhausted, we need to NOT mark breaker open nor failover due to 429 alone?
-                # Spec says 429 NEVER marks tier down and NEVER fails over to next paid tier by itself;
-                # only after backoff attempts exhausted within the tier, move to next tier.
-                # Our implementation exhausts backoff then moves — so failover on 429-exhausted IS allowed
-                # per "only after backoff attempts exhausted within the tier, move to next tier."
-                # So we just collect error and continue.
-                # Distinguish: if it was exhausted 429, do not call mark_failure (keep alive).
-                is_rl = _is_rate_limit(exc)
-                if is_rl:
-                    # Ensure breaker not opened — _call_tier did not call mark_failure for 429 path.
-                    logger.warning("tier %s 429 exhausted, failing over to next tier", getattr(tier, "name", "?"))
-                errors.append(f"{getattr(tier, 'name', '?')}: {exc}")
-                # Continue to next tier if any.
-                if idx == len(tiers) - 1:
-                    break
-                continue
+        for round_idx in range(max_rounds):
+            tiers: list[Tier] = self._registry.active_tiers()  # type: ignore[assignment]
+            if not tiers:
+                await self._log(feature, "none", "none", 0, 0, False, "all LLM tiers unavailable")
+                raise LLMError("all LLM tiers unavailable")
 
-        # All tiers failed.
+            saw_rate_limit = False
+            saw_other_failure = False
+            retry_after_hint: float | None = None
+
+            for idx, tier in enumerate(tiers):
+                candidates: list[str] = self._registry.tier_model_candidates(tier)  # type: ignore[attr-defined]
+                for model in candidates:
+                    try:
+                        result = await self._call_tier(
+                            tier,
+                            messages,
+                            json_mode=json_mode,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            feature=feature,
+                            model_override=model,
+                        )
+                        if idx > 0 or model != getattr(tier, "model", model):
+                            async with self._metrics_lock:
+                                self._metrics["tier_failovers"] = int(self._metrics["tier_failovers"]) + 1  # type: ignore[arg-type]
+                        return result
+                    except RateLimitedError as rle:
+                        saw_rate_limit = True
+                        if rle.retry_after is not None:
+                            retry_after_hint = max(retry_after_hint or 0.0, rle.retry_after)
+                        errors.append(f"{rle.tier}/{rle.model}: 429")
+                        logger.warning(
+                            "429 on %s/%s -> next candidate (round %d/%d)",
+                            rle.tier,
+                            rle.model,
+                            round_idx + 1,
+                            max_rounds,
+                        )
+                        continue  # next model in this tier, then next tier
+                    except Exception as exc:  # noqa: BLE001
+                        # Non-429: _call_tier already marked the breaker + logged.
+                        saw_other_failure = True
+                        errors.append(f"{getattr(tier, 'name', '?')}: {exc}")
+                        break  # abandon this tier, move to the next provider
+
+            # Round finished without success.
+            if not (saw_rate_limit and not saw_other_failure):
+                break  # mixed or non-429 failures — no global backoff rounds
+            if round_idx >= max_rounds - 1:
+                break
+            # Whole chain rate-limited -> global backoff, then retry the chain.
+            wait = retry_after_hint if (retry_after_hint is not None and retry_after_hint > 0) else float(2 ** round_idx)
+            wait *= random.uniform(0.9, 1.2)
+            logger.warning(
+                "all tiers rate-limited (round %d/%d); backing off %.1fs before retrying the chain",
+                round_idx + 1,
+                max_rounds,
+                wait,
+            )
+            await asyncio.sleep(wait)
+
         summary = "; ".join(errors) if errors else "unknown"
-        # Final log already done per tier; also overall metric.
         raise LLMError(f"all tiers failed — {summary}")
